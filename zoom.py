@@ -17,6 +17,12 @@ inpaint_model_list = [
 default_prompt = "A psychedelic jungle with trees that have glowing, fractal-like patterns, Simon stalenhag poster 1920s style, street level view, hyper futuristic, 8k resolution, hyper realistic"
 default_negative_prompt = "frames, borderline, text, charachter, duplicate, error, out of frame, watermark, low quality, ugly, deformed, blur"
 
+height = 512
+width = height
+
+mask_width = 230
+outer_mask_width = 200
+num_interpol_frames = 30
 
 def zoom(
     model_id,
@@ -25,8 +31,10 @@ def zoom(
     num_outpainting_steps,
     guidance_scale,
     num_inference_steps,
-    custom_init_image
+    files
 ):
+    images = [Image.open(file.name) for file in files]
+
     prompts = {}
     for x in prompts_array:
         try:
@@ -35,6 +43,7 @@ def zoom(
             prompts[key] = value
         except ValueError:
             pass
+
     pipe = StableDiffusionInpaintPipeline.from_pretrained(
         model_id,
         torch_dtype=torch.float16,
@@ -49,40 +58,29 @@ def zoom(
     pipe.enable_attention_slicing()
     g_cuda = torch.Generator(device='cuda')
 
-    height = 512
-    width = height
+    current_image = images[0].resize(
+        (width, height), resample=Image.LANCZOS).convert("RGBA")
 
-    current_image = Image.new(mode="RGBA", size=(height, width))
     mask_image = np.array(current_image)[:, :, 3]
     mask_image = Image.fromarray(255-mask_image).convert("RGB")
     current_image = current_image.convert("RGB")
-    if (custom_init_image):
-        current_image = custom_init_image.resize(
-            (width, height), resample=Image.LANCZOS)
-    else:
-        init_images = pipe(prompt=prompts[min(k for k in prompts.keys() if k >= 0)],
-                           negative_prompt=negative_prompt,
-                           image=current_image,
-                           guidance_scale=guidance_scale,
-                           height=height,
-                           width=width,
-                           mask_image=mask_image,
-                           num_inference_steps=num_inference_steps)[0]
-        current_image = init_images[0]
-    mask_width = 128
-    num_interpol_frames = 30
 
     all_frames = []
     all_frames.append(current_image)
 
-    for i in range(num_outpainting_steps):
-        print('Outpaint step: ' + str(i+1) +
-              ' / ' + str(num_outpainting_steps))
-
+    for i in range(1, len(images)):
+        print(f'Iteration {i}')
+        
         prev_image_fix = current_image
 
-        prev_image = shrink_and_paste_on_blank(current_image, mask_width)
+        outer_image = images[i].resize(
+            (width, height), resample=Image.LANCZOS).convert("RGBA")
+        outer_image = np.array(outer_image)
+        outer_image[outer_mask_width:height-outer_mask_width, outer_mask_width:width-outer_mask_width, 3] = 1
+        outer_image = Image.fromarray(outer_image)
 
+        prev_image = shrink_and_paste_on_blank(current_image, mask_width).convert("RGBA")
+        prev_image.alpha_composite(outer_image)
         current_image = prev_image
 
         # create mask (black image with white mask_width width edges)
@@ -91,7 +89,7 @@ def zoom(
 
         # inpainting step
         current_image = current_image.convert("RGB")
-        images = pipe(prompt=prompts[max(k for k in prompts.keys() if k <= i)],
+        gen_images = pipe(prompt=prompts[max(k for k in prompts.keys() if k <= i)],
                       negative_prompt=negative_prompt,
                       image=current_image,
                       guidance_scale=guidance_scale,
@@ -100,7 +98,10 @@ def zoom(
                       # generator = g_cuda.manual_seed(seed),
                       mask_image=mask_image,
                       num_inference_steps=num_inference_steps)[0]
-        current_image = images[0]
+        current_image = gen_images[0]
+
+        current_image.save('test.png', format='PNG')
+
         current_image.paste(prev_image, mask=prev_image)
 
         # interpolation steps bewteen 2 inpainted images (=sequential zoom and crop)
@@ -166,6 +167,9 @@ def zoom_app():
                     value=12,
                     label='Total Outpaint Steps'
                 )
+
+                files = gr.File(file_types=["image"], file_count="multiple")
+
                 with gr.Accordion("Advanced Options", open=False):
                     model_id = gr.Dropdown(
                         choices=inpaint_model_list,
@@ -188,7 +192,6 @@ def zoom_app():
                         value=50,
                         label='Sampling Steps for each outpaint'
                     )
-                    init_image = gr.Image(type="pil")
                 generate_btn = gr.Button(value='Generate video')
 
             with gr.Column():
@@ -204,7 +207,7 @@ def zoom_app():
                 outpaint_steps,
                 guidance_scale,
                 sampling_step,
-                init_image
+                files
             ],
             outputs=output_image,
         )
