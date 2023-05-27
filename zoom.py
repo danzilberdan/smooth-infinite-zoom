@@ -1,3 +1,4 @@
+from typing import List
 from helpers import *
 from diffusers import StableDiffusionInpaintPipeline, EulerAncestralDiscreteScheduler
 from PIL import Image
@@ -14,17 +15,110 @@ inpaint_model_list = [
     "ghunkins/stable-diffusion-liberty-inpainting",
     "ImNoOne/f222-inpainting-diffusers"
 ]
-default_prompt = "A psychedelic jungle with trees that have glowing, fractal-like patterns, Simon stalenhag poster 1920s style, street level view, hyper futuristic, 8k resolution, hyper realistic"
+
 default_negative_prompt = "frames, borderline, text, charachter, duplicate, error, out of frame, watermark, low quality, ugly, deformed, blur"
 
-height = 512
-width = height
-
-mask_width = 230
-outer_mask_width = 200
+height = 480
+width = 720
 num_interpol_frames = 30
+small_ratio = 0.08
+empty_ratio = 0.15
 
 def zoom(
+    model_id,
+    negative_prompt,
+    num_outpainting_steps,
+    guidance_scale,
+    num_inference_steps,
+    files
+):
+    images = [Image.open(file.name) for file in files]
+    
+    pipe = StableDiffusionInpaintPipeline.from_pretrained(
+        model_id,
+        torch_dtype=torch.float16,
+    )
+    pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(
+        pipe.scheduler.config)
+    pipe = pipe.to("cuda")
+
+    def no_check(images, **kwargs):
+        return images, False
+    pipe.safety_checker = no_check
+    pipe.enable_attention_slicing()
+
+    frames = []
+
+    small_image = images[0].resize(
+        (width, height), resample=Image.LANCZOS).convert("RGBA")
+    
+    frames.append(small_image)
+
+    for i in range(1, len(images)):
+        print(f'Iteration {i}')
+        
+        outer_image = images[i].resize(
+            (width, height), resample=Image.LANCZOS).convert("RGBA")
+        
+        resized_small = small_image.resize((round(width * small_ratio), round(height * small_ratio)))
+        coords = np.array(find_similar_coordinates(resized_small, outer_image))
+        print(f'The most similar coordinates found are: {coords}.')
+
+        outer_image = np.array(outer_image)
+        slices_for_small: List[slice] = slices_around_coords(coords, height * small_ratio, width * small_ratio, height, width)
+        slices_for_empty: List[slice] = slices_around_coords(coords, height * empty_ratio, width * empty_ratio, height, width)
+
+        # Updating coords in case the small image touches the border of the outer one.
+        coords = np.array([round((slices_for_small[0].start + slices_for_small[0].stop) / 2),
+                           round((slices_for_small[1].start + slices_for_small[1].stop) / 2)])
+
+        outer_image[slices_for_empty[0], slices_for_empty[1], 3] = 1
+        outer_image[slices_for_small[0], slices_for_small[1]] = np.array(resized_small)
+        outer_image = Image.fromarray(outer_image)
+
+        mask_image = np.array(outer_image)[:, :, 3]
+        mask_image = Image.fromarray(255 - mask_image).convert("RGB")
+        gen_image = pipe(prompt='',
+                      negative_prompt=negative_prompt,
+                      image=outer_image.convert("RGB"),
+                      guidance_scale=guidance_scale,
+                      height=height,
+                      width=width,
+                      mask_image=mask_image,
+                      num_inference_steps=num_inference_steps)[0][0]
+        
+        middle = np.array([round(height / 2), round(width / 2)])
+
+        for j in range(num_interpol_frames - 1):
+            print(f'Rendering frame {j}.')
+            current_middle = middle + (coords - middle) * (j + 1 / num_interpol_frames)
+            # This value get's larger exponentially
+            crop_size_ratio = round(
+                small_ratio ** (1 - (j + 1) / num_interpol_frames)
+            )
+            raw_gen = np.array(gen_image)
+            cropped_slices = slices_around_coords(current_middle, height * crop_size_ratio, width * crop_size_ratio, height, width)
+            print(cropped_slices)
+            cropped = Image.fromarray(raw_gen[cropped_slices[0], cropped_slices[1]])
+
+            frame_base = cropped.resize((width, height))
+
+            raw_frame_base = np.array(frame_base)
+            insert_small_slices = slices_around_coords(
+                current_middle, 
+                height * crop_size_ratio * small_ratio, 
+                width * crop_size_ratio * small_ratio, height, width)
+            raw_frame_base[insert_small_slices[0], insert_small_slices[1]] = \
+                    np.array(small_image.resize((round(width * crop_size_ratio * small_ratio), 
+                                                 round(height * crop_size_ratio * small_ratio))))
+            frame = Image.fromarray(raw_frame_base)
+
+            frames.append(frame)
+        frames.append(gen_image)
+
+
+
+def zoom1(
     model_id,
     prompts_array,
     negative_prompt,
@@ -143,17 +237,6 @@ def zoom_app():
     with gr.Blocks():
         with gr.Row():
             with gr.Column():
-
-                outpaint_prompts = gr.Dataframe(
-                    type="array",
-                    headers=["outpaint steps", "prompt"],
-                    datatype=["number", "str"],
-                    row_count=1,
-                    col_count=(2, "fixed"),
-                    value=[[0, default_prompt]],
-                    wrap=True
-                )
-
                 outpaint_negative_prompt = gr.Textbox(
                     lines=1,
                     value=default_negative_prompt,
@@ -181,7 +264,7 @@ def zoom_app():
                         minimum=0.1,
                         maximum=15,
                         step=0.1,
-                        value=7,
+                        value=0.7,
                         label='Guidance Scale'
                     )
 
@@ -189,20 +272,19 @@ def zoom_app():
                         minimum=1,
                         maximum=100,
                         step=1,
-                        value=50,
+                        value=20,
                         label='Sampling Steps for each outpaint'
                     )
                 generate_btn = gr.Button(value='Generate video')
 
             with gr.Column():
                 output_image = gr.Video(label='Output', format="mp4").style(
-                    width=512, height=512)
+                    width=width, height=height)
 
         generate_btn.click(
             fn=zoom,
             inputs=[
                 model_id,
-                outpaint_prompts,
                 outpaint_negative_prompt,
                 outpaint_steps,
                 guidance_scale,
